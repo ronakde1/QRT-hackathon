@@ -1,14 +1,19 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cctype>
 #include <cstdlib>
+#include <ctime>
 #include <deque>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <numeric>
 #include <set>
 #include <string>
+#include <system_error>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -66,6 +71,34 @@ double monotonic_seconds() {
 
 struct Timeout {};
 struct RestartSearch {};
+struct SolutionFound {};
+
+struct ParallelSearch {
+    const double deadline;
+    const clock_t cpu_start;
+    const double cpu_budget;
+    atomic<bool> stop{false};
+    mutex result_mutex;
+    vector<string> result;
+
+    explicit ParallelSearch(double limit)
+        : deadline(monotonic_seconds() + limit), cpu_start(clock()), cpu_budget(limit) {}
+
+    bool expired(double now) const {
+        if (now >= deadline) return true;
+        clock_t current = clock();
+        return cpu_start != clock_t(-1) && current != clock_t(-1)
+            && double(current - cpu_start) / CLOCKS_PER_SEC >= cpu_budget;
+    }
+
+    void publish(vector<string> candidate) {
+        lock_guard<mutex> lock(result_mutex);
+        if (result.empty()) {
+            result = std::move(candidate);
+            stop.store(true, memory_order_release);
+        }
+    }
+};
 
 struct PearlConstraint {
     vector<int> scope;
@@ -74,13 +107,14 @@ struct PearlConstraint {
 
 class MasyuSolver {
 public:
-    explicit MasyuSolver(const vector<string>& input, double limit = DEFAULT_TIME_LIMIT)
+    explicit MasyuSolver(const vector<string>& input, double limit = DEFAULT_TIME_LIMIT,
+                         ParallelSearch* shared = nullptr)
         : start(monotonic_seconds()), time_limit(limit), deadline(start + limit),
           phase_deadline(deadline), improvement_deadline(deadline), grid(input), t(tables()),
           rows(static_cast<int>(input.size())),
           cols(rows ? static_cast<int>(input[0].size()) : 0), size(rows * cols),
           nbr(size), domains(size, FULL), best_len(size + 1),
-          pearl_neighbors(size, 0), watchers(size) {
+          pearl_neighbors(size, 0), watchers(size), shared_search(shared) {
         for (int i = 0; i < size; ++i) {
             nbr[i].fill(-1);
             int y = i / cols, x = i % cols;
@@ -173,9 +207,22 @@ public:
             }
             return {};  // Python's None.
         }
-        vector<string> result(rows, string(cols, '.'));
-        for (int i = 0; i < size; ++i) result[i / cols][i % cols] = CHARS[t.single_state[best[i]]];
-        return result;
+        return render_best();
+    }
+
+    vector<string> run_first(int branch_strategy) {
+        if (size == 0) return {};
+        first_solution_only = true;
+        strategy = branch_strategy;
+        try {
+            seed_rectangle();
+            dfs(domains);
+        } catch (const SolutionFound&) {
+            // Immediately unwind the search once a complete loop is saved.
+        } catch (const Timeout&) {
+            // Includes cancellation when another worker has a valid solution.
+        }
+        return render_best();
     }
 
 private:
@@ -192,9 +239,20 @@ private:
     vector<int> pearl_neighbors;
     vector<vector<int>> watchers;
     vector<PearlConstraint> constraints;
+    ParallelSearch* shared_search;
+    bool first_solution_only = false;
+
+    vector<string> render_best() const {
+        if (best.empty()) return {};
+        vector<string> result(rows, string(cols, '.'));
+        for (int i = 0; i < size; ++i) result[i / cols][i % cols] = CHARS[t.single_state[best[i]]];
+        return result;
+    }
 
     void check_timeout() const {
+        if (shared_search && shared_search->stop.load(memory_order_acquire)) throw Timeout{};
         double now = monotonic_seconds();
+        if (shared_search && shared_search->expired(now)) throw Timeout{};
         if (now >= deadline || now >= improvement_deadline) throw Timeout{};
         if (best.empty() && now >= phase_deadline) throw RestartSearch{};
     }
@@ -207,6 +265,7 @@ private:
         }
         best = std::move(candidate);
         best_len = length;
+        if (first_solution_only) throw SolutionFound{};
     }
 
     void seed_rectangle() {
@@ -432,6 +491,84 @@ private:
     }
 };
 
+// Independently validate the result before allowing a worker to stop its peers.
+bool valid_loop(const vector<string>& grid, const vector<string>& loop) {
+    int rows = static_cast<int>(grid.size());
+    if (rows == 0 || loop.size() != grid.size()) return false;
+    int cols = static_cast<int>(grid[0].size());
+    if (cols == 0) return false;
+    vector<int> shapes(rows * cols);
+    int used = 0, first = -1;
+    for (int y = 0; y < rows; ++y) {
+        if (static_cast<int>(loop[y].size()) != cols) return false;
+        for (int x = 0; x < cols; ++x) {
+            const char* ch = find(begin(CHARS), end(CHARS) - 1, loop[y][x]);
+            if (ch == end(CHARS) - 1) return false;
+            int i = y * cols + x;
+            shapes[i] = SHAPES[ch - CHARS];
+            if (shapes[i]) { ++used; if (first < 0) first = i; }
+        }
+    }
+    if (used < 4) return false;
+    const array<int, 4> dy = {-1, 0, 1, 0}, dx = {0, 1, 0, -1};
+    vector<array<int, 2>> connections(rows * cols);
+    for (int y = 0; y < rows; ++y) for (int x = 0; x < cols; ++x) {
+        int i = y * cols + x, degree = 0, straight_neighbors = 0;
+        int shape = shapes[i];
+        for (int d = 0; d < 4; ++d) {
+            if (!(shape & DIRS[d])) continue;
+            int ny = y + dy[d], nx = x + dx[d];
+            if (ny < 0 || ny >= rows || nx < 0 || nx >= cols) return false;
+            int j = ny * cols + nx;
+            if (!(shapes[j] & DIRS[(d + 2) % 4])) return false;
+            connections[i][degree++] = j;
+            if (shapes[j] == (N | S) || shapes[j] == (E | W)) ++straight_neighbors;
+        }
+        bool straight = shape == (N | S) || shape == (E | W);
+        if (grid[y][x] == 'W' && (!straight || straight_neighbors == 2)) return false;
+        if (grid[y][x] == 'B' && (!shape || straight || straight_neighbors != 2)) return false;
+    }
+    vector<unsigned char> seen(rows * cols, false);
+    int previous = -1, current = first, visited = 0;
+    while (!seen[current]) {
+        seen[current] = true; ++visited;
+        int next = connections[current][0] == previous
+            ? connections[current][1] : connections[current][0];
+        previous = current; current = next;
+    }
+    return current == first && visited == used;
+}
+
+vector<string> solve_parallel(const vector<string>& grid, double limit = DEFAULT_TIME_LIMIT,
+                              int worker_count = 4) {
+    if (grid.empty() || grid[0].empty() || limit <= 0) return {};
+    ParallelSearch shared(limit);
+    // Initialize immutable tables before starting threads.
+    (void)tables();
+    auto search = [&](int strategy) {
+        if (shared.stop.load(memory_order_acquire) || shared.expired(monotonic_seconds())) return;
+        double remaining = max(0.0, shared.deadline - monotonic_seconds());
+        vector<string> candidate = MasyuSolver(grid, remaining, &shared).run_first(strategy);
+        if (valid_loop(grid, candidate)) shared.publish(std::move(candidate));
+    };
+    worker_count = max(1, min(worker_count, 4));
+    vector<thread> workers;
+    workers.reserve(worker_count - 1);
+    for (int strategy = 1; strategy < worker_count; ++strategy) {
+        try {
+            workers.emplace_back(search, strategy);
+        } catch (const system_error&) {
+            // Restricted judges may refuse extra threads. The calling thread
+            // still runs a complete search and all started workers are joined.
+            break;
+        }
+    }
+    search(0);
+    for (auto& worker : workers) worker.join();
+    // No geometric placeholder: every published result satisfies every pearl.
+    return shared.result;
+}
+
 }  // namespace
 
 /*
@@ -440,7 +577,7 @@ private:
  * The function accepts STRING_ARRAY grid as parameter.
  */
 vector<string> solve(vector<string> grid) {
-    return MasyuSolver(grid).run();
+    return solve_parallel(grid);
 }
 
 #ifndef MASYU_NO_MAIN

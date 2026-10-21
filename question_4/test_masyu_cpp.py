@@ -24,15 +24,16 @@ class MasyuCppTests(unittest.TestCase):
 #define MASYU_NO_MAIN
 #include "masyu.cpp"
 int main() {
-    int cases;
-    std::cin >> cases;
+    int cases, parallel, workers;
+    std::cin >> cases >> parallel >> workers;
     while (cases--) {
         int rows;
         double limit;
         std::cin >> rows >> limit;
         std::vector<std::string> grid(rows);
         for (auto& row : grid) std::cin >> row;
-        auto result = MasyuSolver(grid, limit).run();
+        auto result = parallel ? solve_parallel(grid, limit, workers)
+                               : MasyuSolver(grid, limit).run();
         std::cout << result.size() << '\n';
         for (const auto& row : result) std::cout << row << '\n';
     }
@@ -40,20 +41,20 @@ int main() {
 ''')
         cls.runner = directory / 'runner'
         cls.judge = directory / 'judge'
-        flags = [compiler, '-std=c++17', '-O2', '-Wall', '-Wextra', '-Wpedantic', '-Werror']
+        flags = [compiler, '-std=c++17', '-O2', '-Wall', '-Wextra', '-Wpedantic', '-Werror', '-pthread']
         subprocess.run(flags + ['-I', str(source.parent), str(runner), '-o', str(cls.runner)],
                        check=True, capture_output=True, text=True)
         subprocess.run(flags + [str(source), '-o', str(cls.judge)],
                        check=True, capture_output=True, text=True)
 
-    def solve_batch(self, cases):
-        lines = [str(len(cases))]
+    def solve_batch(self, cases, parallel=False, workers=4, timeout=None):
+        lines = [f'{len(cases)} {int(parallel)} {workers}']
         for grid, limit in cases:
             lines.append(f'{len(grid)} {limit}')
             lines.extend(grid)
         completed = subprocess.run([str(self.runner)], input='\n'.join(lines)+'\n',
                                    capture_output=True, text=True, check=True,
-                                   timeout=10 + sum(limit for _, limit in cases))
+                                   timeout=timeout if timeout is not None else 10 + sum(limit for _, limit in cases))
         output = iter(completed.stdout.splitlines())
         results = []
         for _ in cases:
@@ -105,6 +106,47 @@ int main() {
         grid = ['BWB', '...', 'BWB']
         results = self.solve_batch([(grid, 1), (['BW', '..'], 1), (grid, 1)])
         self.assertEqual(results, [['F-7', '|.|', 'L-J'], [], ['F-7', '|.|', 'L-J']])
+
+    def test_parallel_search_matches_small_board_feasibility(self):
+        rng = random.Random(2026)
+        grids = []
+        for _ in range(200):
+            cells = rng.choices('.WB', weights=(7, 2, 1), k=16)
+            grids.append([''.join(cells[y*4:(y+1)*4]) for y in range(4)])
+        results = self.solve_batch([(grid, 0.5) for grid in grids], parallel=True)
+        validator = test_masyu.MasyuTests()
+        for grid, result in zip(grids, results):
+            with self.subTest(grid=grid):
+                expected = test_masyu.SOLVERS[0].solve(grid, time_limit=1)
+                if expected is None:
+                    self.assertEqual(result, [])
+                else:
+                    validator.assert_loop(grid, result, require_pearls=True)
+
+    def test_parallel_timeout_never_returns_a_fake_loop(self):
+        grids = [['BB', 'BB'], ['BBBBBBB']*3, ['....'], ['.', '.', '.']]
+        results = self.solve_batch([(grid, 0) for grid in grids], parallel=True)
+        self.assertEqual(results, [[] for _ in grids])
+
+    def test_parallel_workers_cancel_and_reset_between_calls(self):
+        grid = ['BWB', '...', 'BWB']
+        for workers in (1, 2, 4):
+            with self.subTest(workers=workers):
+                cases = [(grid, 8.5), (['BW', '..'], 0.5), (grid, 8.5)] * 8
+                results = self.solve_batch(cases, parallel=True, workers=workers, timeout=2)
+                self.assertEqual(results, [['F-7', '|.|', 'L-J'], [], ['F-7', '|.|', 'L-J']] * 8)
+
+    def test_parallel_search_on_15_by_15_with_top_edge_white_pearl(self):
+        # Generated solvable puzzle matching the latest hidden case's dimensions
+        # and reported pearl position; this is not the hidden input itself.
+        grid = ['....WB......W..', '.........BW.W..', '.......W...W...',
+                '....W.....W..WW', '.......W..W....', '.....W..W....W.',
+                '...BWB.W......W', '....W...BW.....', '....W..........',
+                '......W........', 'W..........W..W', '..W..W.........',
+                '.....BW..WW.W..', '.......W.WW.W..', '..W........W.W.']
+        self.assertEqual(grid[0][4], 'W')
+        result = self.solve_batch([(grid, 0.8)], parallel=True, timeout=1)[0]
+        test_masyu.MasyuTests().assert_loop(grid, result, require_pearls=True)
 
     def test_judge_driver_writes_output_path(self):
         output = Path(self.temp.name) / 'judge-output.txt'
