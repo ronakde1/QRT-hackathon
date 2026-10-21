@@ -577,6 +577,8 @@ vector<string> solve_parallel(const vector<string>& grid, double limit = DEFAULT
  * The function accepts STRING_ARRAY grid as parameter.
  */
 vector<string> solve(vector<string> grid) {
+    cerr << "Input grid:\n" << grid.size() << '\n';
+    for (const string& row : grid) cerr << row << '\n';
     return solve_parallel(grid);
 }
 

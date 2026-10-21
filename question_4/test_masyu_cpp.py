@@ -155,7 +155,7 @@ int main() {
                                    check=True, capture_output=True, text=True, timeout=10)
         self.assertEqual(output.read_text(), 'F-7\n|.|\nL-J\n')
         self.assertEqual(completed.stdout, '')
-        self.assertEqual(completed.stderr, '')
+        self.assertEqual(completed.stderr, 'Input grid:\n3\nBWB\n...\nBWB\n')
 
     def test_judge_default_returns_valid_loop_within_one_second(self):
         # Exercise solve(grid) and its production defaults, not the shortened
@@ -173,7 +173,7 @@ int main() {
             grid, output.read_text().splitlines(), require_pearls=True,
         )
         self.assertEqual(completed.stdout, '')
-        self.assertEqual(completed.stderr, '')
+        self.assertEqual(completed.stderr, 'Input grid:\n'+str(len(grid))+'\n'+'\n'.join(grid)+'\n')
 
 
 if __name__ == '__main__':
